@@ -1,0 +1,5 @@
+{"id": "1", "prompt": "What is PagedAttention in one sentence?"}
+{"id": "2", "prompt": "Explain the difference between TTFT and TPOT."}
+{"id": "3", "prompt": "Write a haiku about GPU memory bandwidth."}
+{"id": "4", "prompt": "What is continuous batching and why does it improve GPU utilization?"}
+{"id": "5", "prompt": "Summarize why LLM decode is memory-bandwidth-bound in two sentences."}
