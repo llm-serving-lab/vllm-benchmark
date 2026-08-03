@@ -3,3 +3,18 @@
 {"id": "3", "prompt": "Write a haiku about GPU memory bandwidth."}
 {"id": "4", "prompt": "What is continuous batching and why does it improve GPU utilization?"}
 {"id": "5", "prompt": "Summarize why LLM decode is memory-bandwidth-bound in two sentences."}
+{"id": "s1", "prompt": "My order hasn't arrived yet. Can you check the status?"}
+{"id": "s2", "prompt": "I forgot my password and can't log in. What should I do?"}
+{"id": "s3", "prompt": "The app keeps crashing when I try to open it."}
+{"id": "s4", "prompt": "How do I update my billing information?"}
+{"id": "s5", "prompt": "Do you offer refunds for accidental purchases?"}
+{"id": "s6", "prompt": "The live chat agent disconnected. Can you reconnect me?"}
+{"id": "s7", "prompt": "I was double charged this month. Why?"}
+{"id": "s8", "prompt": "How do I activate two-factor authentication?"}
+{"id": "s9", "prompt": "Where can I download my previous invoices?"}
+{"id": "s10", "prompt": "The confirmation email never arrived."}
+{"id": "s11", "prompt": "Is there a way to export my account data?"}
+{"id": "s12", "prompt": "I need help cancelling my subscription."}
+{"id": "s13", "prompt": "Why is the search function returning no results?"}
+{"id": "s14", "prompt": "How do I change the language settings?"}
+{"id": "s15", "prompt": "My payment keeps failing—what can I try?"}

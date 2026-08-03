@@ -32,6 +32,14 @@ Usage:
         --dataset datasets/prompts.jsonl \\
         --concurrency 1 \\
         --variant concurrency1
+
+For saturation-curve runs at higher concurrency, add --repeat to cycle the
+dataset enough times to get a meaningful sample size for p95/p99 (a 5-prompt
+dataset run once gives only 5 data points per level -- not enough to compute
+a real p99):
+
+    python scripts/run_bench.py \\
+        ... --concurrency 25 --repeat 20 --variant concurrency25
 """
 
 import argparse
@@ -67,6 +75,16 @@ class RequestResult:
     num_requests_running: Optional[float] = None
     num_requests_waiting: Optional[float] = None
     kv_cache_usage_perc: Optional[float] = None
+    # Diagnostic timing, added after an unexplained 36s TTFT outlier at
+    # concurrency=1 (2026-08-02) that the vLLM server's own log did not
+    # corroborate as real prefill time. queue_wait_ms measures time from
+    # task creation (i.e. when run_benchmark builds the task list) to
+    # semaphore acquisition -- if this is large, the delay is harness-side
+    # scheduling/contention, not the server. connect_wait_ms measures
+    # semaphore acquisition to the HTTP stream actually opening -- if this
+    # is large, the delay is in connection setup, not server-side prefill.
+    queue_wait_ms: Optional[float] = None
+    connect_wait_ms: Optional[float] = None
 
 
 # -----------------------------
@@ -125,6 +143,31 @@ def load_dataset(path: Path) -> List[dict]:
     return rows
 
 
+def expand_dataset(rows: List[dict], repeat: int) -> List[dict]:
+    """Cycle through `rows` `repeat` times to reach a larger request volume.
+
+    A 5-prompt dataset run once gives 5 samples per concurrency level, which
+    is not enough to compute a meaningful p95/p99 (p99 of 5 points is just
+    the max). --repeat cycles the same prompt set N times so a concurrency=25
+    or 50 run has enough in-flight volume to make the percentiles meaningful.
+
+    Each repeated copy gets a distinct request_id (e.g. "3" -> "3-r2" on the
+    second pass) so results stay traceable back to which prompt and which
+    pass produced them — original ids are left untouched on the first pass
+    for backward compatibility with existing run outputs.
+    """
+    if repeat <= 1:
+        return rows
+    expanded = []
+    for rep in range(1, repeat + 1):
+        for row in rows:
+            copy = dict(row)
+            if rep > 1:
+                copy["id"] = f"{row.get('id', '')}-r{rep}"
+            expanded.append(copy)
+    return expanded
+
+
 # -----------------------------
 # Single streaming request
 # -----------------------------
@@ -136,6 +179,7 @@ async def run_one_request(
     model: str,
     metrics_url: str,
     row: dict,
+    created_at: Optional[float] = None,
 ) -> RequestResult:
     prompt_id = str(row.get("id", ""))
     prompt_text = row.get("prompt") or row.get("text") or ""
@@ -146,6 +190,15 @@ async def run_one_request(
         ttft_ms=None,
         tpot_ms=None,
     )
+
+    # Time from task creation to this point = time spent waiting on the
+    # semaphore (i.e. queued behind other in-flight requests at this
+    # concurrency level). Recorded even though at concurrency=1 it should
+    # be ~0 for a solitary request -- if it isn't, that's the diagnostic
+    # signal itself.
+    acquired_at = time.perf_counter()
+    if created_at is not None:
+        result.queue_wait_ms = (acquired_at - created_at) * 1000.0
 
     headers = {"Authorization": f"Bearer {api_key}"}
     payload = {
@@ -169,6 +222,8 @@ async def run_one_request(
             json=payload,
             timeout=120.0,
         ) as resp:
+            connected_at = time.perf_counter()
+            result.connect_wait_ms = (connected_at - start) * 1000.0
             resp.raise_for_status()
             async for line in resp.aiter_lines():
                 if not line or not line.startswith("data:"):
@@ -244,8 +299,10 @@ async def run_benchmark(
     concurrency: int,
     variant: str,
     max_samples: Optional[int] = None,
+    repeat: int = 1,
 ) -> Path:
     rows = load_dataset(dataset_path)
+    rows = expand_dataset(rows, repeat)
     if max_samples is not None:
         rows = rows[:max_samples]
 
@@ -256,17 +313,29 @@ async def run_benchmark(
 
     async with httpx.AsyncClient() as client:
 
-        async def bound_run(row):
+        async def bound_run(row, created_at):
             async with semaphore:
                 return await run_one_request(
-                    client, base_url, api_key, model, metrics_url, row
+                    client, base_url, api_key, model, metrics_url, row,
+                    created_at=created_at,
                 )
 
-        tasks = [bound_run(row) for row in rows]
+        # created_at is stamped when the task list is built, i.e. before any
+        # semaphore slot is available -- this is what makes queue_wait_ms a
+        # true measure of harness-side queueing rather than 0 by construction.
+        now = time.perf_counter()
+        tasks = [bound_run(row, now) for row in rows]
         for coro in asyncio.as_completed(tasks):
             r = await coro
             results.append(r)
-            status = "ERR" if r.error else f"{r.ttft_ms:.0f}ms TTFT" if r.ttft_ms else "n/a"
+            if r.error:
+                status = "ERR"
+            elif r.ttft_ms is not None:
+                status = f"{r.ttft_ms:.0f}ms TTFT"
+                if r.queue_wait_ms is not None and r.queue_wait_ms > 50:
+                    status += f" (queue_wait={r.queue_wait_ms:.0f}ms)"
+            else:
+                status = "n/a"
             print(f"  [{r.request_id}] {status}")
 
     runs_dir = Path("runs")
@@ -275,6 +344,7 @@ async def run_benchmark(
 
     fieldnames = [
         "request_id", "prompt", "ttft_ms", "tpot_ms", "total_ms",
+        "queue_wait_ms", "connect_wait_ms",
         "input_tokens", "output_tokens", "tokens_per_sec",
         "num_requests_running", "num_requests_waiting", "kv_cache_usage_perc",
         "error",
@@ -322,13 +392,17 @@ def parse_args():
     p.add_argument("--variant", default="run",
                     help="Name used for output files, e.g. concurrency1, concurrency10")
     p.add_argument("--max-samples", type=int, default=None,
-                    help="Optional cap on number of dataset rows to use")
+                    help="Optional cap on number of dataset rows to use (applied after --repeat expansion)")
+    p.add_argument("--repeat", type=int, default=1,
+                    help="Cycle through the dataset this many times before running, to get enough "
+                         "volume for meaningful p95/p99 at higher concurrency levels (default: 1, no repeat)")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
-    print(f"Running against {args.base_url} | model={args.model} | concurrency={args.concurrency}")
+    print(f"Running against {args.base_url} | model={args.model} | "
+          f"concurrency={args.concurrency} | repeat={args.repeat}")
     asyncio.run(
         run_benchmark(
             base_url=args.base_url,
@@ -338,6 +412,7 @@ def main():
             concurrency=args.concurrency,
             variant=args.variant,
             max_samples=args.max_samples,
+            repeat=args.repeat,
         )
     )
 
