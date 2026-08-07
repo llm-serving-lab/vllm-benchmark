@@ -19,10 +19,12 @@ request completes, to capture scheduler/KV-cache state at that point in time:
     vllm_kv_cache_usage_perc
 
 Note (Apple Silicon / Metal): vLLM does not expose a GPU compute utilization
-percentage metric the way DCGM does on NVIDIA GPUs. On this hardware, GPU
-utilization has to come from a separate `powermetrics` / asitop sample taken
-alongside the run — that's a documented gap, not a bug in this script. See
-README.md "Known limitations" for the plan to close it.
+percentage metric the way DCGM does on NVIDIA GPUs. This script closes that
+gap by *also* scraping observability/powermetrics_exporter.py (Task 6, in
+the vllm-apple-silicon-serving repo) on a separate port (default 9400),
+recording its GPU HW active residency reading as gpu_util_pct. That exporter
+must be running (it needs sudo) for gpu_util_pct to be non-None -- pass
+--no-gpu-metrics to skip the scrape entirely if it isn't. See README.md.
 
 Usage:
     python scripts/run_bench.py \\
@@ -75,6 +77,11 @@ class RequestResult:
     num_requests_running: Optional[float] = None
     num_requests_waiting: Optional[float] = None
     kv_cache_usage_perc: Optional[float] = None
+    # GPU HW active residency percent, from the powermetrics_exporter.py sidecar
+    # (Task 6) on a separate port -- vLLM's own /metrics has no GPU-utilization
+    # number on Apple Silicon (no DCGM equivalent). None if the exporter isn't
+    # running, not a harness bug -- see README "Known limitation" note.
+    gpu_util_pct: Optional[float] = None
     # Diagnostic timing, added after an unexplained 36s TTFT outlier at
     # concurrency=1 (2026-08-02) that the vLLM server's own log did not
     # corroborate as real prefill time. queue_wait_ms measures time from
@@ -102,14 +109,26 @@ METRIC_PATTERNS = {
     "kv_cache_usage_perc": re.compile(r"^vllm:kv_cache_usage_perc(\{[^}]*\})?\s+([0-9.eE+-]+)", re.MULTILINE),
 }
 
+# GPU utilization comes from a *separate* process: observability/powermetrics_exporter.py
+# (built for Phase 1 Task 6, in the vllm-apple-silicon-serving repo), which wraps macOS's
+# `powermetrics` and re-serves it in Prometheus format on its own port (default 9400) since
+# vLLM itself has no GPU-utilization metric on Apple Silicon (no DCGM equivalent). Pattern
+# deliberately mirrors the vllm: patterns' shape (optional label group + value group) so both
+# sets of patterns can share one capture-group index (group 2) in scrape_metrics below.
+GPU_METRIC_PATTERNS = {
+    "gpu_util_pct": re.compile(r"^powermetrics_gpu_active_residency_percent(\{[^}]*\})?\s+([0-9.eE+-]+)", re.MULTILINE),
+}
 
-async def scrape_metrics(client: httpx.AsyncClient, metrics_url: str) -> dict:
-    """Fetch and parse the subset of vLLM Prometheus metrics we care about.
 
-    Returns a dict with None values for any metric not found (older/newer
-    vLLM versions do rename these — see README for the version note).
+async def scrape_metrics(client: httpx.AsyncClient, metrics_url: str, patterns: dict) -> dict:
+    """Fetch a Prometheus /metrics endpoint and parse out the given patterns.
+
+    Returns a dict with None values for any metric not found -- either the
+    endpoint is unreachable (server/exporter not running), or the metric
+    name doesn't match (e.g. a vLLM version that renamed it -- see README
+    for the version note).
     """
-    out = {k: None for k in METRIC_PATTERNS}
+    out = {k: None for k in patterns}
     try:
         resp = await client.get(metrics_url, timeout=5.0)
         resp.raise_for_status()
@@ -117,7 +136,7 @@ async def scrape_metrics(client: httpx.AsyncClient, metrics_url: str) -> dict:
     except Exception:
         return out
 
-    for key, pattern in METRIC_PATTERNS.items():
+    for key, pattern in patterns.items():
         match = pattern.search(text)
         if match:
             try:
@@ -178,6 +197,7 @@ async def run_one_request(
     api_key: str,
     model: str,
     metrics_url: str,
+    gpu_metrics_url: Optional[str],
     row: dict,
     created_at: Optional[float] = None,
 ) -> RequestResult:
@@ -279,10 +299,17 @@ async def run_one_request(
         result.tokens_per_sec = result.output_tokens / (result.total_ms / 1000.0)
 
     # Snapshot scheduler state right after this request completes.
-    metrics = await scrape_metrics(client, metrics_url)
+    metrics = await scrape_metrics(client, metrics_url, METRIC_PATTERNS)
     result.num_requests_running = metrics["num_requests_running"]
     result.num_requests_waiting = metrics["num_requests_waiting"]
     result.kv_cache_usage_perc = metrics["kv_cache_usage_perc"]
+
+    # Same idea, second source: GPU utilization from the powermetrics exporter
+    # sidecar. gpu_metrics_url is None if --gpu-metrics-url wasn't passed, in
+    # which case we skip the scrape entirely rather than hit a bad URL.
+    if gpu_metrics_url:
+        gpu_metrics = await scrape_metrics(client, gpu_metrics_url, GPU_METRIC_PATTERNS)
+        result.gpu_util_pct = gpu_metrics["gpu_util_pct"]
 
     return result
 
@@ -300,6 +327,7 @@ async def run_benchmark(
     variant: str,
     max_samples: Optional[int] = None,
     repeat: int = 1,
+    gpu_metrics_url: Optional[str] = None,
 ) -> Path:
     rows = load_dataset(dataset_path)
     rows = expand_dataset(rows, repeat)
@@ -316,8 +344,8 @@ async def run_benchmark(
         async def bound_run(row, created_at):
             async with semaphore:
                 return await run_one_request(
-                    client, base_url, api_key, model, metrics_url, row,
-                    created_at=created_at,
+                    client, base_url, api_key, model, metrics_url,
+                    gpu_metrics_url, row, created_at=created_at,
                 )
 
         # created_at is stamped when the task list is built, i.e. before any
@@ -347,6 +375,7 @@ async def run_benchmark(
         "queue_wait_ms", "connect_wait_ms",
         "input_tokens", "output_tokens", "tokens_per_sec",
         "num_requests_running", "num_requests_waiting", "kv_cache_usage_perc",
+        "gpu_util_pct",
         "error",
     ]
     with out_path.open("w", newline="", encoding="utf-8") as f:
@@ -396,13 +425,21 @@ def parse_args():
     p.add_argument("--repeat", type=int, default=1,
                     help="Cycle through the dataset this many times before running, to get enough "
                          "volume for meaningful p95/p99 at higher concurrency levels (default: 1, no repeat)")
+    p.add_argument("--gpu-metrics-url", default="http://localhost:9400/metrics",
+                    help="powermetrics_exporter.py URL for gpu_util_pct (default: "
+                         "http://localhost:9400/metrics). Pass --no-gpu-metrics to skip entirely.")
+    p.add_argument("--no-gpu-metrics", action="store_true",
+                    help="Skip GPU metrics scraping even if --gpu-metrics-url is set "
+                         "(e.g. the exporter isn't running this session).")
     return p.parse_args()
 
 
 def main():
     args = parse_args()
+    gpu_metrics_url = None if args.no_gpu_metrics else args.gpu_metrics_url
     print(f"Running against {args.base_url} | model={args.model} | "
-          f"concurrency={args.concurrency} | repeat={args.repeat}")
+          f"concurrency={args.concurrency} | repeat={args.repeat} | "
+          f"gpu_metrics={gpu_metrics_url or 'disabled'}")
     asyncio.run(
         run_benchmark(
             base_url=args.base_url,
@@ -413,6 +450,7 @@ def main():
             variant=args.variant,
             max_samples=args.max_samples,
             repeat=args.repeat,
+            gpu_metrics_url=gpu_metrics_url,
         )
     )
 

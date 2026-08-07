@@ -34,15 +34,35 @@ built-in Prometheus `/metrics` endpoint and records a snapshot of:
 - `num_requests_waiting` (`vllm:num_requests_waiting`)
 - `kv_cache_usage_perc` (`vllm:kv_cache_usage_perc`)
 
-## Known limitation: GPU utilization on Apple Silicon
+It also scrapes a second, separate metrics source — the `powermetrics_exporter.py`
+sidecar on `:9400` — for:
+
+- `gpu_util_pct` (`powermetrics_gpu_active_residency_percent`) — see "GPU
+  utilization on Apple Silicon" below for what this requires and means.
+
+## GPU utilization on Apple Silicon: `gpu_util_pct`
 
 vLLM does not export a GPU compute-utilization percentage metric — that
 normally comes from NVIDIA's DCGM exporter, which has no Metal/Apple Silicon
-equivalent. On this hardware, GPU utilization has to be sampled separately
-via `sudo powermetrics` or `asitop` alongside a benchmark run. This harness
-does not attempt to fake that number; `gpu_util_pct` is intentionally absent
-from the output schema until a Metal-native sampling script is added as a
-follow-up.
+equivalent. This harness closes that gap (Phase 1 item #3) by scraping a
+*second*, separate metrics source: `observability/powermetrics_exporter.py`
+(Task 6, in the [vllm-apple-silicon-serving](https://github.com/rap7239/vllm-apple-silicon-serving)
+repo), which wraps macOS's `powermetrics` and re-serves `GPU HW active
+residency` — the closest Apple-native analog to DCGM's SM-utilization
+percentage — in Prometheus text format on its own port (default `:9400`).
+
+`gpu_util_pct` in the output schema requires that exporter to be running
+(`sudo python3 observability/powermetrics_exporter.py --port 9400`) *before*
+starting a benchmark run — `sudo` is required because `powermetrics` reads
+privileged hardware counters. If the exporter isn't running, `run_bench.py`
+degrades gracefully rather than crashing: `gpu_util_pct` is simply `None`
+for every row (confirmed via `--no-gpu-metrics` or an unreachable
+`--gpu-metrics-url`), not a harness bug. Verified end-to-end 2026-08-06:
+GPU active residency reads ~6% at idle vs. 83-98% during active token
+generation — real signal, not a fixed/fake value, though note this is not
+purely a "cold start" effect (see `PHASE1_LOG.md` for the full reasoning —
+active residency tracks whether the GPU is doing compute *right now*, not a
+one-time warmup cost).
 
 ## Quick start
 
