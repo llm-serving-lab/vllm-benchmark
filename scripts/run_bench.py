@@ -26,6 +26,17 @@ recording its GPU HW active residency reading as gpu_util_pct. That exporter
 must be running (it needs sudo) for gpu_util_pct to be non-None -- pass
 --no-gpu-metrics to skip the scrape entirely if it isn't. See README.md.
 
+Cost model (Phase 1 item #9), opt-in via --cost-hardware-usd: for a
+self-hosted machine (not a metered cloud API), real cost is amortized
+hardware purchase price + electricity, not a per-token bill. Pass
+--cost-hardware-usd 2000 (and optionally --cost-lifetime-years,
+--cost-electricity-per-kwh) to have this script sample the same
+powermetrics_exporter.py's real GPU power draw throughout the run and write
+a {variant}_cost.json summary with cost_per_1k_tokens_usd and
+tokens_per_dollar. GPU-only power (no CPU/memory/disk figures available),
+so the real whole-machine cost is understated, not overstated -- see the
+"note" field in the output.
+
 Usage:
     python scripts/run_bench.py \\
         --base-url http://localhost:8000/v1 \\
@@ -118,6 +129,40 @@ METRIC_PATTERNS = {
 GPU_METRIC_PATTERNS = {
     "gpu_util_pct": re.compile(r"^powermetrics_gpu_active_residency_percent(\{[^}]*\})?\s+([0-9.eE+-]+)", re.MULTILINE),
 }
+
+# Same exporter, different field -- real GPU power draw in milliwatts, used
+# by the cost model below (Phase 1 item #9). Sampled on its own background
+# loop rather than per-request, since cost is a run-level economic quantity
+# (see cost_per_1k_tokens comment in run_benchmark) that needs to reflect the
+# *whole* run's wall-clock duration, including idle/queued time between
+# requests -- not just the instant each request happens to finish.
+GPU_POWER_PATTERN = {
+    "gpu_power_mw": re.compile(r"^powermetrics_gpu_power_milliwatts(\{[^}]*\})?\s+([0-9.eE+-]+)", re.MULTILINE),
+}
+
+
+async def sample_power_continuously(
+    client: httpx.AsyncClient,
+    gpu_metrics_url: str,
+    interval_s: float,
+    samples: List[float],
+    stop_event: asyncio.Event,
+) -> None:
+    """Background task: samples GPU power once every `interval_s` seconds for
+    as long as the benchmark run is in progress, appending each reading to
+    `samples`. Runs independently of individual requests so the eventual
+    average reflects the whole run's wall-clock time -- active generation
+    *and* idle/queued gaps -- matching how real infrastructure billing works
+    (you pay for the hour whether the GPU was busy the whole time or not).
+    """
+    while not stop_event.is_set():
+        metrics = await scrape_metrics(client, gpu_metrics_url, GPU_POWER_PATTERN)
+        if metrics["gpu_power_mw"] is not None:
+            samples.append(metrics["gpu_power_mw"])
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=interval_s)
+        except asyncio.TimeoutError:
+            pass
 
 
 async def scrape_metrics(client: httpx.AsyncClient, metrics_url: str, patterns: dict) -> dict:
@@ -328,6 +373,10 @@ async def run_benchmark(
     max_samples: Optional[int] = None,
     repeat: int = 1,
     gpu_metrics_url: Optional[str] = None,
+    cost_hardware_usd: Optional[float] = None,
+    cost_lifetime_years: float = 2.0,
+    cost_electricity_per_kwh: float = 0.15,
+    cost_power_sample_interval_s: float = 1.0,
 ) -> Path:
     rows = load_dataset(dataset_path)
     rows = expand_dataset(rows, repeat)
@@ -339,7 +388,19 @@ async def run_benchmark(
     semaphore = asyncio.Semaphore(concurrency)
     results: List[RequestResult] = []
 
+    power_samples_mw: List[float] = []
+    power_stop_event = asyncio.Event()
+    run_start = time.perf_counter()
+
     async with httpx.AsyncClient() as client:
+        power_task = None
+        if cost_hardware_usd is not None and gpu_metrics_url:
+            power_task = asyncio.create_task(
+                sample_power_continuously(
+                    client, gpu_metrics_url, cost_power_sample_interval_s,
+                    power_samples_mw, power_stop_event,
+                )
+            )
 
         async def bound_run(row, created_at):
             async with semaphore:
@@ -365,6 +426,11 @@ async def run_benchmark(
             else:
                 status = "n/a"
             print(f"  [{r.request_id}] {status}")
+
+        run_end = time.perf_counter()
+        if power_task is not None:
+            power_stop_event.set()
+            await power_task
 
     runs_dir = Path("runs")
     runs_dir.mkdir(exist_ok=True)
@@ -397,7 +463,105 @@ async def run_benchmark(
     n_err = sum(1 for r in results if r.error)
     print(f"\nSaved {len(results)} results ({n_ok} ok, {n_err} errors) to {out_path}")
     print(f"Full per-chunk detail: {jsonl_path}")
+
+    if cost_hardware_usd is not None:
+        cost_path = runs_dir / f"{variant}_cost.json"
+        cost_summary = compute_cost_summary(
+            results=results,
+            run_duration_s=run_end - run_start,
+            power_samples_mw=power_samples_mw,
+            hardware_usd=cost_hardware_usd,
+            lifetime_years=cost_lifetime_years,
+            electricity_per_kwh=cost_electricity_per_kwh,
+        )
+        with cost_path.open("w", encoding="utf-8") as f:
+            json.dump(cost_summary, f, indent=2)
+        print(f"Cost summary: {cost_path}")
+        if cost_summary["cost_per_1k_tokens_usd"] is not None:
+            print(
+                f"  ${cost_summary['cost_per_1k_tokens_usd']:.6f}/1K tokens | "
+                f"{cost_summary['tokens_per_dollar']:.1f} tokens/$ | "
+                f"avg GPU power {cost_summary['avg_gpu_power_watts']:.2f}W "
+                f"({cost_summary['power_sample_count']} samples over "
+                f"{cost_summary['run_duration_s']:.1f}s)"
+            )
+        else:
+            print("  (no GPU power samples collected -- is the powermetrics exporter running?)")
+
     return out_path
+
+
+# -----------------------------
+# Cost model (Phase 1 item #9)
+# -----------------------------
+
+def compute_cost_summary(
+    results: List["RequestResult"],
+    run_duration_s: float,
+    power_samples_mw: List[float],
+    hardware_usd: float,
+    lifetime_years: float,
+    electricity_per_kwh: float,
+) -> dict:
+    """Run-level cost_per_1k_tokens / tokens_per_dollar for a self-hosted
+    machine, not a metered cloud API.
+
+    Two real dollar costs exist for hardware you already own: amortized
+    purchase price (spread over its useful lifetime, like a car's
+    depreciation) and electricity (real power draw x a $/kWh rate, like the
+    car's gas). Deliberately averages GPU power over the run's *entire*
+    wall-clock duration, including idle/queued gaps between requests, not
+    just active-generation instants -- a real deployment pays for idle GPU
+    time too (same as a cloud GPU instance billed by the hour regardless of
+    utilization), so a poorly-utilized run should correctly show up as
+    worse $/token, not have that idle cost quietly excluded.
+
+    Known limitation, stated plainly rather than glossed over: this is
+    GPU-only power (from powermetrics_exporter.py, which exposes no CPU/
+    memory/disk/PSU-loss figures), so the real whole-machine cost is
+    understated, not overstated.
+    """
+    hourly_hardware_usd = hardware_usd / (lifetime_years * 8760.0)
+
+    avg_power_mw = sum(power_samples_mw) / len(power_samples_mw) if power_samples_mw else None
+    avg_power_w = avg_power_mw / 1000.0 if avg_power_mw is not None else None
+    hourly_electricity_usd = (
+        (avg_power_w / 1000.0) * electricity_per_kwh if avg_power_w is not None else None
+    )
+
+    total_output_tokens = sum(r.output_tokens for r in results)
+    run_duration_hours = run_duration_s / 3600.0
+
+    cost_per_1k_tokens = None
+    tokens_per_dollar = None
+    total_run_cost_usd = None
+    if hourly_electricity_usd is not None:
+        hourly_total_usd = hourly_hardware_usd + hourly_electricity_usd
+        total_run_cost_usd = hourly_total_usd * run_duration_hours
+        if total_output_tokens > 0 and total_run_cost_usd > 0:
+            cost_per_1k_tokens = (total_run_cost_usd / total_output_tokens) * 1000.0
+            tokens_per_dollar = total_output_tokens / total_run_cost_usd
+
+    return {
+        "hardware_usd": hardware_usd,
+        "lifetime_years": lifetime_years,
+        "hourly_hardware_usd": hourly_hardware_usd,
+        "electricity_per_kwh": electricity_per_kwh,
+        "power_sample_count": len(power_samples_mw),
+        "avg_gpu_power_watts": avg_power_w,
+        "hourly_electricity_usd": hourly_electricity_usd,
+        "run_duration_s": run_duration_s,
+        "total_output_tokens": total_output_tokens,
+        "total_run_cost_usd": total_run_cost_usd,
+        "cost_per_1k_tokens_usd": cost_per_1k_tokens,
+        "tokens_per_dollar": tokens_per_dollar,
+        "note": (
+            "GPU-only electricity cost (no CPU/memory/disk/PSU-loss figures "
+            "available from powermetrics_exporter.py) -- understates true "
+            "whole-machine cost. Power averaged over the whole run duration, "
+            "including idle/queued time, not just active generation."
+        ),
+    }
 
 
 # -----------------------------
@@ -431,6 +595,17 @@ def parse_args():
     p.add_argument("--no-gpu-metrics", action="store_true",
                     help="Skip GPU metrics scraping even if --gpu-metrics-url is set "
                          "(e.g. the exporter isn't running this session).")
+    p.add_argument("--cost-hardware-usd", type=float, default=None,
+                    help="Purchase price of the machine, e.g. 2000. Enables the cost model "
+                         "(cost_per_1k_tokens / tokens_per_dollar) for this run -- omit to skip it.")
+    p.add_argument("--cost-lifetime-years", type=float, default=2.0,
+                    help="Assumed useful lifetime in years, used to amortize --cost-hardware-usd "
+                         "into a $/hour figure (default: 2.0)")
+    p.add_argument("--cost-electricity-per-kwh", type=float, default=0.15,
+                    help="Assumed electricity rate in $/kWh (default: 0.15, roughly US average)")
+    p.add_argument("--cost-power-sample-interval", type=float, default=1.0,
+                    help="Seconds between GPU power samples for the cost model's electricity "
+                         "term (default: 1.0)")
     return p.parse_args()
 
 
@@ -451,6 +626,10 @@ def main():
             max_samples=args.max_samples,
             repeat=args.repeat,
             gpu_metrics_url=gpu_metrics_url,
+            cost_hardware_usd=args.cost_hardware_usd,
+            cost_lifetime_years=args.cost_lifetime_years,
+            cost_electricity_per_kwh=args.cost_electricity_per_kwh,
+            cost_power_sample_interval_s=args.cost_power_sample_interval,
         )
     )
 
