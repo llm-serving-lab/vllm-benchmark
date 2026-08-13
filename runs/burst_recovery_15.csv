@@ -1,0 +1,2 @@
+request_id,prompt,ttft_ms,tpot_ms,total_ms,queue_wait_ms,connect_wait_ms,input_tokens,output_tokens,tokens_per_sec,num_requests_running,num_requests_waiting,kv_cache_usage_perc,gpu_util_pct,error
+1,What is PagedAttention in one sentence?,77885.109917,121.36385038636372,83794.068667,0.07125000000002268,576.7991669999999,15,53,0.632503002218731,0.0,0.0,0.0,,

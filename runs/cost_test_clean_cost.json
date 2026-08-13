@@ -1,0 +1,15 @@
+{
+  "hardware_usd": 2000.0,
+  "lifetime_years": 2.0,
+  "hourly_hardware_usd": 0.1141552511415525,
+  "electricity_per_kwh": 0.15,
+  "power_sample_count": 59,
+  "avg_gpu_power_watts": 12.725610169491524,
+  "hourly_electricity_usd": 0.0019088415254237287,
+  "run_duration_s": 68.660028875,
+  "total_output_tokens": 1588,
+  "total_run_cost_usd": 0.0022136010982959065,
+  "cost_per_1k_tokens_usd": 0.0013939553515717295,
+  "tokens_per_dollar": 717383.0918418354,
+  "note": "GPU-only electricity cost (no CPU/memory/disk/PSU-loss figures available from powermetrics_exporter.py) -- understates true whole-machine cost. Power averaged over the whole run duration, including idle/queued time, not just active generation."
+}
