@@ -1,5 +1,6 @@
 venv/
 mcp_server/.venv/
+mcp_server/traces.jsonl
 __pycache__/
 *.pyc
 .DS_Store

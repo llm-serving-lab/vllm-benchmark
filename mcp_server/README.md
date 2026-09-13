@@ -17,6 +17,18 @@ hand each time.
   if the run was recorded with a hardware cost.
 - `run_benchmark(...)` — runs `run_bench.py` against a live vLLM server and
   returns its summary + cost inline.
+- `get_trace_history(limit)` — the most recent tool-call traces (newest
+  first): every tool's duration/success/error, plus `run_benchmark`'s own
+  per-stage breakdown (`smoke_test` / `subprocess_run` / `summarize`).
+
+## Tracing
+Every tool call is traced to `traces.jsonl` (gitignored, operational data —
+see `tracing.py`): a `@traced` decorator on all five tools records a
+uniform duration/success/error line, and `run_benchmark` additionally uses
+a `StageTimer` to record which of its three real internal phases actually
+took the time. Deliberately not a full OpenTelemetry/Jaeger stack — just
+enough structure to answer "trace every step, show a latency breakdown by
+stage" for a tool-calling agent.
 
 ## Why this design
 Modeled on the same lifecycle-guardrail pattern as an internal Locust
