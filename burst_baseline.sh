@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd ~/Documents/vllm-benchmark
+cd "$(dirname "$0")"
 
 echo "--- throwaway warmup request (absorbing first-batch stall) ---"
 ./venv/bin/python3 scripts/run_bench.py \

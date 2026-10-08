@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd ~/Documents/vllm-benchmark
+cd "$(dirname "$0")"
 
 # Fires the same single canary prompt (dataset row 1, deterministic since
 # run_bench.py doesn't shuffle) every 5s, 24 times (~2 minutes), so every

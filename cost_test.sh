@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
-cd ~/Documents/vllm-benchmark
+cd "$(dirname "$0")"
 
 echo "--- warmup at concurrency=5 (same as real test, zero gap before it) ---"
 ./venv/bin/python3 scripts/run_bench.py \
