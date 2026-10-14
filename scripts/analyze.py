@@ -200,7 +200,9 @@ def build_chart(summary: pd.DataFrame, out_path: Path):
 
     ax = axes[2]
     ax.plot(summary["variant"], summary["aggregate_tokens_per_sec"], marker="o",
-            color="green", label="Aggregate (total work/sec)")
+            color="green", label="Aggregate, steady state")
+    ax.plot(summary["variant"], summary["aggregate_tokens_per_sec_whole_run"], marker="o",
+            color="green", linestyle=":", label="Aggregate, whole run (warmup incl.)")
     ax.plot(summary["variant"], summary["avg_tokens_per_sec_per_request"], marker="o",
             color="orange", linestyle="--", label="Per-request average")
     ax.set_title("Throughput vs run")
