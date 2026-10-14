@@ -106,22 +106,33 @@ def summarize(paths: list[Path]) -> pd.DataFrame:
             continue
 
         # Aggregate throughput = total output tokens across every steady-state
-        # request, divided by the wall-clock span those requests actually
-        # occupied (last request's completion minus first request's start,
-        # approximated here via total_ms + queue_wait_ms per request isn't
-        # directly comparable across overlapping requests -- so this uses
-        # total output tokens / (max total_ms among steady requests), which
-        # approximates "how much real work got done per second of wall clock
-        # once the server was warm and running at this concurrency level."
-        # This is the number that answers "is the server doing more total
-        # work at higher concurrency," which avg_tokens_per_sec (a per-request
-        # average) does NOT answer -- per-request throughput naturally drops
-        # as more requests share one GPU even when aggregate throughput rises.
+        # request, divided by the wall-clock span those requests occupied
+        # (first steady request's start to last one's completion). This is the
+        # number that answers "is the server doing more total work at higher
+        # concurrency," which avg_tokens_per_sec (a per-request average) does
+        # NOT answer -- per-request throughput naturally drops as more
+        # requests share one GPU even when aggregate throughput rises.
+        #
+        # run_bench.py creates every request task at the same instant, so
+        # queue_wait_ms is each request's start offset from the run's start
+        # and queue_wait_ms + total_ms its completion offset. Corrected
+        # 2026-10-13: the earlier version divided by the longest single
+        # request's total_ms instead of the span, which overstated throughput
+        # by up to ~19x at concurrency=1 (see PHASE1_LOG.md correction note).
+        # The whole-run figure (warmup included) is reported alongside,
+        # because the steady-state window at high concurrency mostly covers
+        # the run's draining tail.
         total_output_tokens = steady["output_tokens"].sum()
-        wall_clock_span_s = steady["total_ms"].max() / 1000.0 if len(steady) else 0
-        aggregate_tokens_per_sec = (
-            total_output_tokens / wall_clock_span_s if wall_clock_span_s > 0 else None
-        )
+        aggregate_tokens_per_sec = None
+        aggregate_tokens_per_sec_whole_run = None
+        if "queue_wait_ms" in steady:
+            start_s = steady["queue_wait_ms"].min() / 1000.0
+            end_s = (steady["queue_wait_ms"] + steady["total_ms"]).max() / 1000.0
+            if end_s > start_s:
+                aggregate_tokens_per_sec = total_output_tokens / (end_s - start_s)
+            run_end_s = (ok["queue_wait_ms"] + ok["total_ms"]).max() / 1000.0
+            if run_end_s > 0:
+                aggregate_tokens_per_sec_whole_run = ok["output_tokens"].sum() / run_end_s
 
         rows.append({
             "variant": concurrency_from_filename(path),
@@ -145,6 +156,7 @@ def summarize(paths: list[Path]) -> pd.DataFrame:
             # Total work done per second of wall clock -- the real "did
             # throughput improve at this concurrency level" answer.
             "aggregate_tokens_per_sec": aggregate_tokens_per_sec,
+            "aggregate_tokens_per_sec_whole_run": aggregate_tokens_per_sec_whole_run,
             "avg_kv_cache_usage_perc": steady["kv_cache_usage_perc"].mean(),
             "max_num_requests_waiting": steady["num_requests_waiting"].max(),
         })

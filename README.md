@@ -166,21 +166,29 @@ since half that run's requests sat in the warmup cluster.
 
 | Concurrency | TTFT p50 | TTFT p95 | TTFT p99 | Aggregate tok/s | Warmup excluded |
 |---|---|---|---|---|---|
-| 1  | 273ms | 364ms   | 545ms   | 282.4 | 1 |
-| 5  | 482ms | 588ms   | 638ms   | 93.6  | 5 |
-| 10 | 728ms | 785ms   | 864ms   | 100.3 | 10 |
-| 25 | 760ms | 1,031ms | 1,557ms | 147.5 | 25 |
-| 50 | 1,348ms | 2,147ms | 2,170ms | 80.2 | 50 |
+| 1  | 273ms | 364ms   | 545ms   | 14.8 | 1 |
+| 5  | 482ms | 588ms   | 638ms   | 25.4 | 5 |
+| 10 | 728ms | 785ms   | 864ms   | 36.7 | 10 |
+| 25 | 760ms | 1,031ms | 1,557ms | 73.4 | 25 |
+| 50 | 1,348ms | 2,147ms | 2,170ms | 54.3 | 50 |
 
 TTFT climbs gradually through concurrency 25, then p95/p99 both bend
 sharply upward at 50 — the non-linear tail-latency inflection point this
 task exists to find. Aggregate throughput (total output tokens / wall-clock
 span — the real "is the server doing more total work" number, as opposed to
 per-request average tokens/sec, which naturally declines with concurrency
-even when the server is doing fine) peaks at concurrency=25 and *drops*
-at 50, below even the concurrency=5 level — a second, independent signal
-that 50 has crossed past this server's practical concurrency ceiling on
-this hardware. Full chart: `charts/saturation_curve.png`.
+even when the server is doing fine) scales about 5x from concurrency 1 to
+25 and then plateaus. The steady-state figure at 50 (54.3) is lower than at
+25, but that window mostly covers the run's draining tail; counting the
+whole run, warmup included, gives 79.2 tok/s at 50 vs 71.0 at 25, so the
+evidence is a plateau, not a drop. Full chart: `charts/saturation_curve.png`.
+
+**Correction (2026-10-13):** the aggregate tok/s column originally
+published here (282.4 / 93.6 / 100.3 / 147.5 / 80.2) was overstated by a
+bug in `analyze.py`, which divided total tokens by the longest single
+request's duration instead of the run's wall-clock span. The values above
+are recomputed from the same CSVs with the fixed script; the TTFT columns
+were unaffected.
 
 ## Repo structure
 
